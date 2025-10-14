@@ -1,0 +1,69 @@
+[Unit]
+Description=Liquidsoap Stream
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=liquidsoap
+Group=liquidsoap
+WorkingDirectory=/home/liquidsoap
+ExecStart=/usr/bin/liquidsoap /etc/liquidsoap/stream.liq
+Restart=always
+RestartSec=5
+TimeoutStopSec=15
+KillSignal=SIGINT
+StandardOutput=journal
+StandardError=journal
+
+# ---- Tuning knobs (env) ----
+Environment=LS_MUSIC_DIR=/srv/music
+Environment=LS_DB=/var/lib/liquidsoap/liquidsoap.db
+
+# Separation windows
+Environment=LS_ARTIST_SEP_MIN=45        # minutes
+Environment=LS_TITLE_SEP_MIN=180        # minutes
+Environment=LS_TRACK_SEP_SEC=0          # 0 = off
+
+# Cache + lock behavior
+Environment=LS_RESCAN_SEC=86400         # rebuild cache at least every 24h
+Environment=LS_LOCK_STALE_SEC=3600      # 1h stale lock window
+Environment=LS_TOP_N_DIRS=64
+Environment=LS_FILES_PER_DIR_TRY=128
+
+# Tags / scanning
+Environment=LS_FFPROBE_TIMEOUT_S=0.8
+Environment=LS_SCAN_EXTS=.mp3,.flac,.m4a,.ogg,.wav,.aac
+Environment=LS_UNKNOWN_ARTIST_BUCKET=1  # bucket missing artist tags
+
+# History retention
+Environment=LS_HISTORY_KEEP=10000
+Environment=LS_HISTORY_KEEP_PATHS=20000
+
+LimitNOFILE=131072
+Nice=5
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectControlGroups=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectClock=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictNamespaces=true
+RestrictRealtime=true
+SystemCallArchitectures=native
+
+ProtectSystem=strict
+ReadWritePaths=/var/lib/liquidsoap
+ReadOnlyPaths=/srv/music
+ReadOnlyPaths=/home/liquidsoap
+
+[Install]
+WantedBy=multi-user.target
+

@@ -1,0 +1,66 @@
+<icecast>
+    <location>Your Location</location>
+    <admin>Your Email</admin>
+    <hostname>stream.example.com</hostname>
+    <server_id>Icecast</server_id>
+
+    <limits>
+	<clients>100</clients>
+	<sources>1</sources>
+	<queue-size>262144</queue-size>
+	<client-timeout>120</client-timeout>
+	<header-timeout>30</header-timeout>
+	<source-timeout>10</source-timeout>
+	<burst-size>131072</burst-size>
+	<burst-on-connect>1</burst-on-connect>
+    </limits>
+
+    <authentication>
+        <source-password>seriouslychangethis</source-password>
+        <relay-password>noreallyyoushouldchangethis</relay-password>
+        <admin-user>admin</admin-user>
+        <admin-password>absolutelychangewhateverthisis</admin-password>
+    </authentication>
+
+    <listen-socket>
+        <port>8000</port>
+        <bind-address>0.0.0.0</bind-address>
+    </listen-socket>
+    <listen-socket>
+        <port>8000</port>
+        <bind-address>::</bind-address>
+    </listen-socket>
+
+    <http-headers>
+        <header type="cors" name="Access-Control-Allow-Origin" />
+    </http-headers>
+
+    <mount>
+        <mount-name>/live</mount-name>
+        <hidden>0</hidden>
+    </mount>
+
+    <paths>
+        <basedir>/usr/share/icecast2</basedir>
+        <logdir>/var/log/icecast2</logdir>
+        <webroot>/usr/share/icecast2/web</webroot>
+        <adminroot>/usr/share/icecast2/admin</adminroot>
+        <pidfile>/usr/share/icecast2/icecast.pid</pidfile>
+        <alias source="/" destination="/status.xsl"/>
+    </paths>
+
+    <logging>
+        <accesslog>access.log</accesslog>
+        <errorlog>error.log</errorlog>
+        <loglevel>3</loglevel>
+        <logsize>10000</logsize>
+    </logging>
+
+    <security>
+        <chroot>false</chroot>
+        <changeowner>
+            <user>icecast2</user>
+            <group>icecast</group>
+        </changeowner>
+    </security>
+</icecast>

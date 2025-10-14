@@ -1,0 +1,348 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="theme-color" content="#0b1220" />
+  <title>Radio Player — Live</title>
+  <!--
+    SIMPLE, SINGLE-FILE PLAYER (NO NGINX CACHING)
+    -----------------------------------------
+    • Plays your Icecast stream
+    • Pulls artist/title from status-json.xsl
+    • Finds album art via iTunes API (direct, no caching proxy)
+    • Updates mobile lock screen via Media Session API
+
+    IMPORTANT (CORS):
+    If this HTML is hosted on a different domain than your Icecast status JSON
+    the browser may block the fetch unless the server sends
+    Access-Control-Allow-Origin: *. If that happens, either host this HTML on
+    the same domain as the stream/status (easiest) or put a tiny proxy in front
+    (e.g. Cloudflare Worker).
+  -->
+  <style>
+    :root{
+      --bg: #0b1220;      /* deep navy */
+      --fg: #e8eefc;      /* soft white */
+      --muted: #9bb0d0;   /* slate */
+      --accent: #79a8ff;  /* blue */
+      --card: #121b30;    /* darker navy */
+    }
+    html,body{height:100%}
+    body{
+      margin:0; background: radial-gradient(1200px 800px at 20% 0%, #152140 0%, var(--bg) 45%, #070b16 100%);
+      color:var(--fg); font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, Noto Sans, "Apple Color Emoji","Segoe UI Emoji";
+      display:grid; place-items:center; padding:24px;
+    }
+    .wrap{ width:min(780px, 100%); }
+    .card{
+      background: linear-gradient(180deg, rgba(255,255,255,0.04), rgba(255,255,255,0.02));
+      backdrop-filter: blur(6px);
+      border: 1px solid rgba(255,255,255,0.08);
+      border-radius: 24px;
+      box-shadow: 0 20px 60px rgba(0,0,0,0.45);
+      padding: 24px; display:grid; gap:20px; align-items:center;
+    }
+    .top{ display:grid; gap:18px; grid-template-columns: 160px 1fr; }
+    @media (max-width:700px){ .top{ grid-template-columns: 1fr; } }
+    .art{
+      width:160px; height:160px; border-radius: 16px; object-fit:cover;
+      background: #1c2747; border:1px solid rgba(255,255,255,0.08);
+    }
+    h1{ font-size: 24px; line-height:1.2; margin:0; }
+    .artist{ color:var(--muted); font-size:16px; margin: 4px 0 0; }
+    .row{ display:flex; gap:12px; align-items:center; flex-wrap:wrap; }
+    .btn{
+      appearance:none; border:0; padding:12px 16px; border-radius:14px;
+      background: var(--accent); color:#041028; font-weight:600;
+      box-shadow: 0 6px 18px rgba(121,168,255,0.45);
+      cursor:pointer; transition: transform .06s ease-in-out;
+    }
+    .btn:active{ transform: translateY(1px) }
+    .ghost{
+      background: transparent; color: var(--fg); border:1px solid rgba(255,255,255,0.14);
+    }
+    .meta{ color: var(--muted); font-size: 12px; }
+    .footer{ display:flex; justify-content:space-between; align-items:center; }
+    a{ color: var(--accent); text-decoration:none; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <div class="top">
+        <img id="art" class="art" alt="Album art" src="/radio/artwork-512.png"/>
+        <div>
+          <h1 id="title">Loading...</h1>
+          <div id="artist" class="artist">—</div>
+          <div class="row" style="margin-top:12px">
+            <button id="play" class="btn">▶︎ Play</button>
+            <a id="openExternal" class="btn ghost" href="https://stream.example.com/live.m3u" rel="noopener">Open in external player</a>
+          </div>
+        </div>
+      </div>
+      <div class="footer" style="display:none">
+        <div class="meta">Now playing updates every 10s</div>
+        <div class="meta" id="updated">—</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Hidden audio element (we drive it with our Play button) -->
+  <audio id="player" preload="none" playsinline></audio>
+
+<script>
+(function(){
+  const STREAM_URL   = 'https://stream.example.com/live';
+  const STATUS_URL   = 'https://stream.example.com/status-json.xsl';
+  const TARGET_MOUNT = '/live';
+  const STATUS_PROXY = ''; // if you ever need to proxy status requests
+
+  const FALLBACK_ART_512 = '/radio/artwork-512.png';
+  const FALLBACK_ART_192 = '/radio/artwork-192.png';
+  const FALLBACK_ART_096 = '/radio/artwork-096.png';
+
+  const els = {
+    art: document.getElementById('art'),
+    title: document.getElementById('title'),
+    artist: document.getElementById('artist'),
+    updated: document.getElementById('updated'),
+    play: document.getElementById('play'),
+    player: document.getElementById('player'),
+  };
+
+  // Prep media elements
+  els.art.crossOrigin = "anonymous";
+  els.art.referrerPolicy = "no-referrer";
+
+  els.player.crossOrigin = "anonymous";
+  els.player.src = STREAM_URL;
+
+  // --- Reconnect logic: gentle, debounced, no unnecessary src changes ---
+  let userPaused = false;
+  let lastProgressT = 0;             // last time we saw timeupdate progress
+  let lastReconnectAt = 0;           // last actual reconnect moment
+  const RECONNECT_COOLDOWN = 60000;  // 60s
+  const STALL_THRESHOLD = 25000;     // 25s "truly stuck" window
+  let stallTimer = null;
+
+  function now(){ return Date.now(); }
+
+  function clearStallTimer(){
+    if (stallTimer) { clearTimeout(stallTimer); stallTimer = null; }
+  }
+
+  async function gentleNudge(){
+    try { await els.player.play(); } catch(_) {}
+  }
+
+  async function hardReconnect(reason){
+    if (userPaused) return;
+    const t = now();
+    if (t - lastReconnectAt < RECONNECT_COOLDOWN) return; // debounce
+    lastReconnectAt = t;
+
+    try {
+      els.player.pause();
+      els.player.load();
+      await els.player.play();
+      console.debug('[radio] hardReconnect (reload) due to', reason);
+    } catch {
+      // Final fallback: cache-bust
+      try {
+        const u = STREAM_URL + (STREAM_URL.includes('?') ? '&' : '?') + '_=' + t;
+        els.player.src = u;
+        els.player.load();
+        await els.player.play();
+        console.debug('[radio] hardReconnect (cache-bust) due to', reason);
+      } catch(e) {
+        console.warn('[radio] reconnect failed:', e);
+      }
+    }
+  }
+
+  function scheduleStallWatch(){
+    clearStallTimer();
+    stallTimer = setTimeout(async () => {
+      const stuckFor = now() - lastProgressT;
+      if (stuckFor >= STALL_THRESHOLD) {
+        await gentleNudge();
+        // Give the nudge 2s; if still no progress, reconnect
+        setTimeout(() => {
+          const stillStuck = (now() - lastProgressT) >= (STALL_THRESHOLD + 2000);
+          if (stillStuck) hardReconnect('prolonged-waiting');
+        }, 2000);
+      }
+    }, STALL_THRESHOLD);
+  }
+
+  // Play/pause button
+  els.play.addEventListener('click', async () => {
+    try {
+      if (els.player.paused) {
+        userPaused = false;
+        await els.player.play();
+        els.play.textContent = '⏸ Pause';
+      } else {
+        userPaused = true;
+        els.player.pause();
+        els.play.textContent = '▶︎ Play';
+        clearStallTimer();
+      }
+    } catch (e) { console.warn('Play error', e); }
+  });
+
+  // Progress detection
+  els.player.addEventListener('timeupdate', () => {
+    lastProgressT = now();
+    clearStallTimer();
+  });
+
+  // Playing => we're healthy; clear stall logic
+  els.player.addEventListener('playing', () => {
+    lastProgressT = now();
+    clearStallTimer();
+  });
+
+  // Waiting happens normally on live streams; only worry if prolonged
+  els.player.addEventListener('waiting', () => {
+    scheduleStallWatch();
+  });
+
+  // Only reconnect on hard failures
+  ['error','stalled','abort','emptied','ended'].forEach(ev => {
+    els.player.addEventListener(ev, () => hardReconnect(ev));
+  });
+
+  // Network/visibility: don't force; just nudge
+  window.addEventListener('online', gentleNudge);
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) gentleNudge(); });
+
+  // ---- Media Session + Now Playing ----
+  function setMediaSession(meta){
+    if (!('mediaSession' in navigator)) return;
+    try {
+      navigator.mediaSession.metadata = new MediaMetadata({
+        title:  meta.title || 'Live',
+        artist: meta.artist || 'Radio Player',
+        album:  meta.album || '',
+        artwork: meta.artwork || [
+          { src: FALLBACK_ART_512, sizes:'512x512', type:'image/png' },
+          { src: FALLBACK_ART_192, sizes:'192x192', type:'image/png' },
+          { src: FALLBACK_ART_096, sizes:'96x96',  type:'image/png'  },
+        ]
+      });
+      navigator.mediaSession.setActionHandler('play',  () => els.player.play().catch(()=>{}));
+      navigator.mediaSession.setActionHandler('pause', () => els.player.pause());
+      navigator.mediaSession.setActionHandler('stop',  () => els.player.pause());
+    } catch (_) {}
+  }
+
+  function pickSource(json){
+    const root = json && json.icestats; if (!root) return null;
+    let srcs = root.source; if (!srcs) return null;
+    if (!Array.isArray(srcs)) srcs = [srcs];
+    return srcs.find(o => (o.listenurl && o.listenurl.includes(TARGET_MOUNT))) || srcs[0] || null;
+  }
+
+  function splitTitleArtist(raw){
+    if (!raw) return { artist:'', title:'' };
+    const parts = String(raw).split(/\s[-–—]\s/);
+    if (parts.length >= 2) return { artist: parts[0], title: parts.slice(1).join(' - ') };
+    return { artist:'', title:String(raw) };
+  }
+
+  async function fetchStatus(){
+    const url = STATUS_PROXY ? (new URL(STATUS_URL, STATUS_PROXY)).toString() : STATUS_URL;
+    const r = await fetch(url, { cache:'no-store', mode:'cors' });
+    if (!r.ok) throw new Error('status ' + r.status);
+    return r.json();
+  }
+
+  // Direct iTunes API call (no caching proxy)
+  async function findArtwork(artist, title){
+    try{
+      if (!artist && !title) throw 0;
+
+      const q = encodeURIComponent(`${artist} ${title}`.trim());
+      // Direct iTunes API call
+      const r = await fetch(`https://itunes.apple.com/search?term=${q}&entity=song&limit=1`, { cache:'default' });
+      const data = await r.json();
+
+      if (data && data.results && data.results.length){
+        // Force HTTPS and upsize artwork
+        const secure = (u) => u.replace(/^http:\/\//i, 'https://');
+        const raw100 = secure(data.results[0].artworkUrl100);
+        const upsize = (u, size) => u.replace(/\d+x\d+bb\.jpg/i, `${size}x${size}bb.jpg`);
+
+        const art512 = upsize(raw100, 512);
+        const art192 = upsize(raw100, 192);
+        const art096 = upsize(raw100, 96);
+
+        return { url: art512, ms: [
+          { src: art512, sizes:'512x512', type:'image/jpeg' },
+          { src: art192, sizes:'192x192', type:'image/jpeg' },
+          { src: art096, sizes:'96x96',  type:'image/jpeg' },
+        ]};
+      }
+    }catch(_){}
+
+    // fallback to your bundled PNGs
+    return { url: FALLBACK_ART_512, ms:[
+      { src: FALLBACK_ART_512, sizes:'512x512', type:'image/png' },
+      { src: FALLBACK_ART_192, sizes:'192x192', type:'image/png' },
+      { src: FALLBACK_ART_096, sizes:'96x96',  type:'image/png' },
+    ]};
+  }
+
+  // Preflight image load so desktop never shows a broken/mixed-content block
+  function setArt(url){
+    return new Promise(resolve => {
+      const test = new Image();
+      test.crossOrigin = "anonymous";
+      test.referrerPolicy = "no-referrer";
+      test.onload = () => { els.art.src = url; resolve(true); };
+      test.onerror = () => resolve(false);
+      test.src = url;
+    });
+  }
+
+  let lastKey = '';
+  async function refresh(){
+    try{
+      const data = await fetchStatus();
+      const src = pickSource(data);
+      let artist = '', title = '', album = '';
+      if (src){
+        if (src.artist && src.title){ artist = src.artist; title = src.title; }
+        else { ({artist, title} = splitTitleArtist(src.title || src["yp_currently_playing"] || '')); }
+      }
+      const key = `${artist}|${title}`;
+      if (!key.trim()) return;
+
+      els.title.textContent = title || 'Live';
+      els.artist.textContent = artist || '—';
+      if (els.updated) { els.updated.textContent = new Date().toLocaleTimeString(); }
+
+      if (key !== lastKey){
+        const art = await findArtwork(artist, title);
+        const ok = await setArt(art.url);
+        if (!ok) await setArt(FALLBACK_ART_512);
+        setMediaSession({ title, artist, album, artwork: art.ms });
+        lastKey = key;
+      }
+    }catch(e){
+      console.warn('NP refresh failed:', e);
+      if (els.updated) { els.updated.textContent = 'status unavailable'; }
+    }
+  }
+
+  // Kick things off
+  lastProgressT = now();
+  refresh();
+  setInterval(refresh, 10000);
+
+})();
+</script>
+</body>
+</html>

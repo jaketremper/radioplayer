@@ -1,0 +1,121 @@
+# Enable album art caching
+proxy_cache_path /var/cache/nginx/itunes keys_zone=itunes:10m inactive=14d max_size=2g;
+resolver 1.1.1.1 1.0.0.1 valid=300s ipv6=off;
+map $request_method $cache_bypass { default 0; PURGE 1; }
+
+# Rudimentary scraper blocking
+map $http_user_agent $block_scraper {
+    default 0;
+    ~*(curl|wget|python|php|go-http-client|scrapy|httpclient) 1;
+}
+
+# Better scraper blocking via rate limiting
+limit_conn_zone $binary_remote_addr zone=connperip:10m;
+limit_req_zone $binary_remote_addr zone=reqperip:10m rate=30r/m;
+
+# Your icecast server
+upstream icecast {
+    server 127.0.0.1:8000;
+    keepalive 32;
+}
+
+# put the following in your server block:
+
+if ($block_scraper) { return 403; }
+
+if ($scheme != "https") {
+    return 301 https://$host$request_uri;
+}
+
+client_max_body_size 10m;
+sendfile on;
+
+keepalive_timeout 15;
+keepalive_requests 1000;
+
+location /radio {
+    alias /var/www/html/jaketremper;
+    try_files $uri /index.html =404;
+}
+
+location = /live {
+    default_type "";
+
+    if ($request_method = HEAD) {
+        add_header Accept-Ranges "bytes";
+        return 200;
+    }
+
+    proxy_pass http://icecast/live;
+    proxy_http_version 1.1;
+    proxy_set_header Connection "";
+
+    gzip off; gunzip off;
+    proxy_set_header Accept-Encoding "";
+    proxy_buffering off;
+    proxy_request_buffering off;
+
+    proxy_set_header Icy-MetaData "0";
+    proxy_hide_header icy-metaint;
+    proxy_hide_header icy-name;
+    proxy_hide_header icy-url;
+
+    add_header Accept-Ranges "bytes" always;
+
+    add_header Access-Control-Allow-Origin "*" always;
+    add_header Access-Control-Allow-Methods "GET, HEAD, OPTIONS" always;
+    add_header Access-Control-Expose-Headers "Content-Length,Content-Range,Accept-Ranges" always;
+
+    add_header Cache-Control "no-store" always;
+    proxy_read_timeout 12h;
+    send_timeout 12h;
+    proxy_redirect off;
+    limit_conn connperip 3;
+}
+
+location = /status-json.xsl {
+    add_header Access-Control-Allow-Origin "*" always;
+    add_header Cache-Control "no-store, no-cache, must-revalidate, max-age=0" always;
+
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-Proto https;
+    proxy_buffering off;
+    proxy_request_buffering off;
+
+    limit_req zone=reqperip burst=30 nodelay;
+
+    proxy_pass http://icecast;
+    proxy_redirect off;
+}
+
+location /itunes/search {
+    proxy_pass https://itunes.apple.com/search$is_args$args;
+
+    proxy_cache itunes;
+    proxy_cache_valid 200 302 7d;
+    proxy_cache_valid 404 5m;
+    proxy_ignore_headers Set-Cookie Expires Cache-Control;
+
+    proxy_hide_header Content-Disposition;
+    add_header Content-Type "application/json; charset=utf-8";
+    add_header X-Cache-Status $upstream_cache_status always;
+}
+
+location /itunes/art {
+    if ($arg_u = "") { return 400; }
+
+    proxy_pass $arg_u;
+    proxy_ssl_server_name on;
+    proxy_set_header Host $proxy_host;
+
+    proxy_cache itunes;
+    proxy_cache_key $arg_u;
+    proxy_cache_valid 200 30d;
+    proxy_cache_lock on;
+    proxy_ignore_headers Set-Cookie Expires Cache-Control;
+
+    proxy_hide_header Content-Disposition;
+    add_header Content-Type "image/jpeg";
+    add_header X-Cache-Status $upstream_cache_status always;
+}
