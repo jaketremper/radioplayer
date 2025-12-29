@@ -1,13 +1,12 @@
 <!doctype html>
 <html lang="en">
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <meta name="theme-color" content="#0b1220" />
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#0b1220">
   <title>Radio Player — Live</title>
   <!--
     SIMPLE, SINGLE-FILE PLAYER
-    -----------------------------------------
     • Plays your Icecast stream
     • Pulls artist/title from status-json.xsl
     • Finds album art (iTunes fallback; optional Last.fm key)
@@ -71,7 +70,7 @@
   <div class="wrap">
     <div class="card">
       <div class="top">
-        <img id="art" class="art" alt="Album art" src="/radio/artwork-512.png"/>
+        <img id="art" class="art" alt="Album art" src="/radio/artwork-512.png">
         <div>
           <h1 id="title">Loading...</h1>
           <div id="artist" class="artist">—</div>
@@ -89,7 +88,7 @@
   </div>
 
   <!-- Hidden audio element (we drive it with our Play button) -->
-  <audio id="player" preload="none" playsinline></audio>
+  <audio id="player" preload="none"></audio>
 
 <script>
 (function(){
