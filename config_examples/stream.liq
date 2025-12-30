@@ -4,9 +4,7 @@ def on_start_meta(m) =
   artist = if m["artist"] != "" then m["artist"] else "" end
   title  = if m["title"]  != "" then m["title"]  else "" end
   file   = if m["filename"] != "" then m["filename"] else "" end
-
   log("ON-AIR: #{artist} - #{title} (#{file})")
-
   ignore(process.run(
     "/usr/bin/python3 /usr/local/bin/ls_radio.py track-start "
     ^ "--artist " ^ q(artist) ^ " "
@@ -28,19 +26,41 @@ end
 radio = request.dynamic(next_request)
 radio = map_metadata(on_start_meta, radio)
 
-radio = mksafe(crossfade(radio))
-
-radio = normalize(radio, target=-16.0, threshold=-22.0, window=0.5)
-
-radio = compress(radio,
-  threshold=-18.0,    # Higher threshold = less aggressive
-  ratio=2.5,          # Gentler ratio
-  attack=0.01,        # Slightly slower attack
-  release=0.3,        # Longer release to avoid pumping
-  gain=3.0            # Make up gain
+radio = mksafe(
+  crossfade(
+    duration     = 5.0,
+    fade_in      = 2.5,
+    fade_out     = 2.5,
+    smart        = false,
+    conservative = true,
+    radio
+  )
 )
 
-radio = limit(radio, threshold=-0.5, attack=0.005, release=0.1)
+radio = normalize(
+  radio,
+  target   = -18.0,
+  threshold= -40.0,
+  window   = 2.0,
+  gain_max = 6.0,
+  gain_min = -6.0
+)
+
+radio = compress(
+  radio,
+  threshold = -14.0,
+  ratio     = 1.8,
+  attack    = 0.02,
+  release   = 0.25,
+  gain      = 0.0
+)
+
+radio = limit(
+  radio,
+  threshold = -1.0,
+  attack    = 0.005,
+  release   = 0.1
+)
 
 output.icecast(
   %mp3(bitrate=192),
