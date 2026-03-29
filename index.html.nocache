@@ -1,15 +1,16 @@
 <!doctype html>
 <html lang="en">
 <head>
+  <link rel="preconnect" href="https://stream.example.com">
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="theme-color" content="#0b1220">
   <title>Radio Player — Live</title>
   <!--
-    SIMPLE, SINGLE-FILE PLAYER (NO NGINX CACHING)
+    SIMPLE, SINGLE-FILE PLAYER
     • Plays your Icecast stream
     • Pulls artist/title from status-json.xsl
-    • Finds album art via iTunes API (direct, no caching proxy)
+    • Finds album art (iTunes fallback; optional Last.fm key)
     • Updates mobile lock screen via Media Session API
 
     IMPORTANT (CORS):
@@ -64,6 +65,16 @@
     .meta{ color: var(--muted); font-size: 12px; }
     .footer{ display:flex; justify-content:space-between; align-items:center; }
     a{ color: var(--accent); text-decoration:none; }
+    @keyframes btn-pulse {
+      0%   { box-shadow: 0 6px 18px rgba(121,168,255,0.45), 0 0 0 0 rgba(121,168,255,0.5); }
+      60%  { box-shadow: 0 6px 18px rgba(121,168,255,0.45), 0 0 0 10px rgba(121,168,255,0); }
+      100% { box-shadow: 0 6px 18px rgba(121,168,255,0.45), 0 0 0 0 rgba(121,168,255,0); }
+    }
+    .btn-loading {
+      animation: btn-pulse 0.7s ease-out infinite;
+      opacity: 0.75;
+      cursor: wait;
+    }
   </style>
 </head>
 <body>
@@ -88,7 +99,7 @@
   </div>
 
   <!-- Hidden audio element (we drive it with our Play button) -->
-  <audio id="player" preload="none"></audio>
+  <audio id="player" preload="auto"></audio>
 
 <script>
 (function(){
@@ -117,19 +128,25 @@
   els.player.crossOrigin = "anonymous";
   els.player.src = STREAM_URL;
 
-  // --- Reconnect logic: gentle, debounced, no unnecessary src changes ---
-  let userPaused = false;
-  let lastProgressT = 0;             // last time we saw timeupdate progress
-  let lastReconnectAt = 0;           // last actual reconnect moment
-  const RECONNECT_COOLDOWN = 15000;  // 15s
-  const STALL_THRESHOLD = 10000;     // 10s "truly stuck" window
-  let stallTimer = null;
+  // --- Reconnect logic ---
+  // Silent-drop detection uses the Web Audio API to watch actual signal level.
+  // Browser playback events (waiting/stalled) are unreliable on live streams:
+  // timeupdate and currentTime keep advancing even when the audio output is
+  // silent, so event-based stall detection misses the most common failure mode.
+
+  let userPaused     = false;
+  let lastReconnectAt = 0;
+  const RECONNECT_COOLDOWN = 15000;  // min ms between reconnects
+  const SILENCE_THRESHOLD  = 0.001;  // RMS below this = silent
+  const SILENCE_TRIP_SECS  = 8;      // consecutive silent seconds before reconnect
+  const SILENCE_POLL_MS    = 1000;   // how often to sample the analyser
+
+  let audioCtx    = null;
+  let analyser    = null;
+  let silencePoll = null;
+  let silentSince = null;           // timestamp when silence started, or null
 
   function now(){ return Date.now(); }
-
-  function clearStallTimer(){
-    if (stallTimer) { clearTimeout(stallTimer); stallTimer = null; }
-  }
 
   async function gentleNudge(){
     try { await els.player.play(); } catch(_) {}
@@ -138,41 +155,82 @@
   async function hardReconnect(reason){
     if (userPaused) return;
     const t = now();
-    if (t - lastReconnectAt < RECONNECT_COOLDOWN) return; // debounce
+    if (t - lastReconnectAt < RECONNECT_COOLDOWN) return;
     lastReconnectAt = t;
+    silentSince = null; // reset silence clock after reconnect attempt
 
+    console.debug('[radio] hardReconnect due to:', reason);
     try {
       els.player.pause();
       els.player.load();
       await els.player.play();
-      console.debug('[radio] hardReconnect (reload) due to', reason);
     } catch {
-      // Final fallback: cache-bust
       try {
         const u = STREAM_URL + (STREAM_URL.includes('?') ? '&' : '?') + '_=' + t;
         els.player.src = u;
         els.player.load();
         await els.player.play();
-        console.debug('[radio] hardReconnect (cache-bust) due to', reason);
       } catch(e) {
         console.warn('[radio] reconnect failed:', e);
       }
     }
   }
 
-  function scheduleStallWatch(){
-    clearStallTimer();
-    stallTimer = setTimeout(async () => {
-      const stuckFor = now() - lastProgressT;
-      if (stuckFor >= STALL_THRESHOLD) {
-        await gentleNudge();
-        // Give the nudge 2s; if still no progress, reconnect
-        setTimeout(() => {
-          const stillStuck = (now() - lastProgressT) >= (STALL_THRESHOLD + 2000);
-          if (stillStuck) hardReconnect('prolonged-waiting');
-        }, 2000);
+  // Web Audio silence detector.
+  // Wired up once on first play; survives pause/resume without re-creating.
+  function ensureAudioGraph(){
+    if (audioCtx) return;
+    try {
+      audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      const src = audioCtx.createMediaElementSource(els.player);
+      analyser  = audioCtx.createAnalyser();
+      analyser.fftSize = 256;
+      src.connect(analyser);
+      analyser.connect(audioCtx.destination);
+    } catch(e) {
+      console.warn('[radio] Web Audio setup failed, falling back to event-only detection:', e);
+      audioCtx = null;
+      analyser  = null;
+    }
+  }
+
+  function getRMS(){
+    if (!analyser) return null;
+    const buf = new Float32Array(analyser.fftSize);
+    analyser.getFloatTimeDomainData(buf);
+    let sum = 0;
+    for (const v of buf) sum += v * v;
+    return Math.sqrt(sum / buf.length);
+  }
+
+  function startSilencePoller(){
+    if (silencePoll) return;
+    silentSince = null;
+    silencePoll = setInterval(() => {
+      if (userPaused || els.player.paused) { silentSince = null; return; }
+
+      // Resume suspended AudioContext (browsers suspend after user-gesture gap)
+      if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume().catch(()=>{});
+
+      const rms = getRMS();
+      if (rms === null) return;
+
+      if (rms < SILENCE_THRESHOLD){
+        if (!silentSince) silentSince = now();
+        const silentFor = (now() - silentSince) / 1000;
+        if (silentFor >= SILENCE_TRIP_SECS){
+          console.debug(`[radio] silence detected (${silentFor.toFixed(1)}s, rms=${rms.toFixed(5)}), reconnecting`);
+          hardReconnect('silence-detector');
+        }
+      } else {
+        silentSince = null; // signal present, reset
       }
-    }, STALL_THRESHOLD);
+    }, SILENCE_POLL_MS);
+  }
+
+  function stopSilencePoller(){
+    if (silencePoll){ clearInterval(silencePoll); silencePoll = null; }
+    silentSince = null;
   }
 
   // Play/pause button
@@ -180,42 +238,40 @@
     try {
       if (els.player.paused) {
         userPaused = false;
+        els.play.textContent = '\u23f8 Pause';
+        els.play.classList.add('btn-loading');
+        ensureAudioGraph();
+        if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume(); // no await
         await els.player.play();
-        els.play.textContent = '⏸ Pause';
+        els.play.classList.remove('btn-loading');
+        startSilencePoller();
       } else {
         userPaused = true;
         els.player.pause();
-        els.play.textContent = '▶︎ Play';
-        clearStallTimer();
+        els.play.textContent = '\u25b6\ufe0e Play';
+        stopSilencePoller();
       }
     } catch (e) { console.warn('Play error', e); }
   });
 
-  // Progress detection
-  els.player.addEventListener('timeupdate', () => {
-    lastProgressT = now();
-    clearStallTimer();
-  });
-
-  // Playing => we're healthy; clear stall logic
+  // Start poller whenever playback begins (covers autoplay scenarios)
   els.player.addEventListener('playing', () => {
-    lastProgressT = now();
-    clearStallTimer();
+    if (!userPaused) startSilencePoller();
   });
 
-  // Waiting happens normally on live streams; only worry if prolonged
-  els.player.addEventListener('waiting', () => {
-    scheduleStallWatch();
-  });
-
-  // Only reconnect on hard failures
+  // Hard event failures still trigger immediate reconnect
   ['error','stalled','abort','emptied','ended'].forEach(ev => {
-    els.player.addEventListener(ev, () => hardReconnect(ev));
+    els.player.addEventListener(ev, () => { if (!userPaused) hardReconnect(ev); });
   });
 
-  // Network/visibility: don't force; just nudge
+  // Network restore / tab-visible: nudge back to life
   window.addEventListener('online', gentleNudge);
-  document.addEventListener('visibilitychange', () => { if (!document.hidden) gentleNudge(); });
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden && !userPaused) {
+      if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume().catch(()=>{});
+      gentleNudge();
+    }
+  });
 
   // ---- Media Session + Now Playing ----
   function setMediaSession(meta){
@@ -258,26 +314,25 @@
     return r.json();
   }
 
-  // Direct iTunes API call (no caching proxy)
+  // Force HTTPS for iTunes artwork and provide a robust fallback
   async function findArtwork(artist, title){
     try{
       if (!artist && !title) throw 0;
 
       const q = encodeURIComponent(`${artist} ${title}`.trim());
-      // Direct iTunes API call
-      const r = await fetch(`https://itunes.apple.com/search?term=${q}&entity=song&limit=1`, { cache:'default' });
+      // hits your nginx cache proxy
+      const r = await fetch(`/itunes/search?term=${q}&entity=song&limit=1`, { cache:'no-store' });
       const data = await r.json();
 
       if (data && data.results && data.results.length){
-        // Force HTTPS and upsize artwork
         const secure = (u) => u.replace(/^http:\/\//i, 'https://');
         const raw100 = secure(data.results[0].artworkUrl100);
         const upsize = (u, size) => u.replace(/\d+x\d+bb\.jpg/i, `${size}x${size}bb.jpg`);
 
-        const art512 = upsize(raw100, 512);
-        const art192 = upsize(raw100, 192);
-        const art096 = upsize(raw100, 96);
-
+        // route image URLs through your nginx image proxy for caching
+	const art512 = `/itunes/art?u=${upsize(raw100,512)}`;
+	const art192 = `/itunes/art?u=${upsize(raw100,192)}`;
+	const art096 = `/itunes/art?u=${upsize(raw100,96)}`;
         return { url: art512, ms: [
           { src: art512, sizes:'512x512', type:'image/jpeg' },
           { src: art192, sizes:'192x192', type:'image/jpeg' },
@@ -337,7 +392,6 @@
   }
 
   // Kick things off
-  lastProgressT = now();
   refresh();
   setInterval(refresh, 10000);
 
