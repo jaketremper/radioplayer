@@ -121,8 +121,8 @@
   let userPaused = false;
   let lastProgressT = 0;             // last time we saw timeupdate progress
   let lastReconnectAt = 0;           // last actual reconnect moment
-  const RECONNECT_COOLDOWN = 60000;  // 60s
-  const STALL_THRESHOLD = 25000;     // 25s "truly stuck" window
+  const RECONNECT_COOLDOWN = 15000;  // 15s
+  const STALL_THRESHOLD = 10000;     // 10s "truly stuck" window
   let stallTimer = null;
 
   function now(){ return Date.now(); }
