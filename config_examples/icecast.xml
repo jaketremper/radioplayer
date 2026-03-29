@@ -8,10 +8,10 @@
         <clients>100</clients>
         <sources>1</sources>
         <queue-size>524288</queue-size>
-        <client-timeout>60</client-timeout>
+        <client-timeout>30</client-timeout>
         <header-timeout>30</header-timeout>
-        <source-timeout>30</source-timeout>
-        <burst-size>524288</burst-size>
+        <source-timeout>10</source-timeout>
+        <burst-size>65536</burst-size>
         <burst-on-connect>1</burst-on-connect>
     </limits>
 
