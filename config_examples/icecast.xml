@@ -5,14 +5,14 @@
     <server_id>Icecast</server_id>
 
     <limits>
-	<clients>100</clients>
-	<sources>1</sources>
-	<queue-size>262144</queue-size>
-	<client-timeout>120</client-timeout>
-	<header-timeout>30</header-timeout>
-	<source-timeout>10</source-timeout>
-	<burst-size>131072</burst-size>
-	<burst-on-connect>1</burst-on-connect>
+        <clients>100</clients>
+        <sources>1</sources>
+        <queue-size>524288</queue-size>
+        <client-timeout>60</client-timeout>
+        <header-timeout>30</header-timeout>
+        <source-timeout>30</source-timeout>
+        <burst-size>524288</burst-size>
+        <burst-on-connect>1</burst-on-connect>
     </limits>
 
     <authentication>
