@@ -21,8 +21,6 @@ upstream icecast {
 
 # put the following in your server block:
 
-if ($block_scraper) { return 403; }
-
 if ($scheme != "https") {
     return 301 https://$host$request_uri;
 }
