@@ -138,7 +138,7 @@
   let lastReconnectAt = 0;
   const RECONNECT_COOLDOWN = 15000;  // min ms between reconnects
   const SILENCE_THRESHOLD  = 0.001;  // RMS below this = silent
-  const SILENCE_TRIP_SECS  = 8;      // consecutive silent seconds before reconnect
+  const SILENCE_TRIP_SECS  = 1;      // consecutive silent seconds before reconnect
   const SILENCE_POLL_MS    = 1000;   // how often to sample the analyser
 
   let audioCtx    = null;
