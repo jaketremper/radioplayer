@@ -14,7 +14,8 @@ Environment vars (see systemd unit for defaults):
   LS_ARTIST_SEP_MIN, LS_TITLE_SEP_MIN, LS_TRACK_SEP_SEC,
   LS_FFPROBE_TIMEOUT_S, LS_SCAN_EXTS, LS_UNKNOWN_ARTIST_BUCKET,
   LS_HISTORY_KEEP, LS_HISTORY_KEEP_PATHS,
-  LS_TOP_N_DIRS, LS_FILES_PER_DIR_TRY
+  LS_TOP_N_DIRS, LS_FILES_PER_DIR_TRY,
+  LS_EVERGREEN_DIR, LS_SLOT_PRE_SEC, LS_SLOT_POST_SEC
 """
 
 import os, sys, time, json, random, pathlib, subprocess, tempfile, argparse, atexit, signal, sqlite3, re, unicodedata
@@ -41,6 +42,14 @@ SCAN_EXTS = set(e.strip().lower() for e in os.environ.get("LS_SCAN_EXTS",".mp3,.
 TOP_N_DIRS        = int(os.environ.get("LS_TOP_N_DIRS", "64"))
 FILES_PER_DIR_TRY = int(os.environ.get("LS_FILES_PER_DIR_TRY", "128"))
 
+# Evergreen / scheduled content
+# Drop audio files into LS_EVERGREEN_DIR to have one played automatically
+# near each quarter-hour boundary. If the directory is empty or unset,
+# the feature is silently disabled and normal music plays uninterrupted.
+EVERGREEN_DIR = os.environ.get("LS_EVERGREEN_DIR", "/var/lib/liquidsoap/evergreen")
+SLOT_PRE_SEC  = int(os.environ.get("LS_SLOT_PRE_SEC",  "150"))  # seconds before :00/:15/:30/:45
+SLOT_POST_SEC = int(os.environ.get("LS_SLOT_POST_SEC", "150"))  # seconds after
+
 random.seed(time.time_ns())
 
 # ------------- UTIL -------------
@@ -58,6 +67,48 @@ def ensure_dir(path: str):
     d = os.path.dirname(path)
     if d:
         os.makedirs(d, exist_ok=True)
+
+# ------------- SLOT LOGIC -------------
+SLOT_MINUTES = (0, 15, 30, 45)
+
+def current_slot_id() -> int:
+    """
+    Return an integer uniquely identifying the current quarter-hour slot,
+    or -1 if we're not inside any slot window.
+
+    Slot ID = hour * 4 + slot_index.
+
+    With default 2.5-min pre/post windows:
+      :00 -> 57:30–02:30  (wraps hour boundary)
+      :15 -> 12:30–17:30
+      :30 -> 27:30–32:30
+      :45 -> 42:30–47:30
+
+    Returns -1 if EVERGREEN_DIR is not configured or doesn't exist.
+    """
+    if not EVERGREEN_DIR:
+        return -1
+
+    t = time.localtime()
+    total_secs = t.tm_min * 60 + t.tm_sec  # seconds into current hour
+
+    for i, m in enumerate(SLOT_MINUTES):
+        slot_secs = m * 60
+
+        if m == 0:
+            # :00 wraps the hour boundary
+            secs_after  = total_secs        # seconds past :00
+            secs_before = 3600 - total_secs # seconds until next :00
+            if secs_after <= SLOT_POST_SEC:
+                return t.tm_hour * 4 + 0
+            if secs_before <= SLOT_PRE_SEC:
+                return ((t.tm_hour + 1) % 24) * 4 + 0
+        else:
+            diff = total_secs - slot_secs
+            if -SLOT_PRE_SEC <= diff <= SLOT_POST_SEC:
+                return t.tm_hour * 4 + i
+
+    return -1
 
 # ------------- DB -------------
 SCHEMA = """
@@ -102,6 +153,12 @@ CREATE TABLE IF NOT EXISTS locks (
   name TEXT PRIMARY KEY,
   pid  INTEGER NOT NULL,
   ts   REAL NOT NULL
+);
+
+-- tracks which quarter-hour slots have already had a clip served
+CREATE TABLE IF NOT EXISTS evergreen_played (
+  slot_id INTEGER PRIMARY KEY,
+  ts      REAL NOT NULL
 );
 """
 
@@ -263,7 +320,6 @@ def violation_score(con, artist_norm: str, title_norm: str, path: str) -> float:
     return min(sa, st, sp)
 
 def stamp_selection(con, path: str, artist_norm: str, title_norm: str):
-    # optional pre-stamp at selection time (best effort)
     now = now_ts()
     if artist_norm:
         con.execute("INSERT INTO last_artist_play(artist_norm, ts) VALUES(?,?) ON CONFLICT(artist_norm) DO UPDATE SET ts=excluded.ts", (artist_norm, now))
@@ -271,9 +327,6 @@ def stamp_selection(con, path: str, artist_norm: str, title_norm: str):
         con.execute("INSERT INTO last_title_play(title_norm, ts) VALUES(?,?) ON CONFLICT(title_norm) DO UPDATE SET ts=excluded.ts", (title_norm, now))
     if TRACK_SEP and path:
         con.execute("INSERT INTO last_path_play(path, ts) VALUES(?,?) ON CONFLICT(path) DO UPDATE SET ts=excluded.ts", (path, now))
-    # prune by LRU-ish age via row count limits
-    # SQLite doesn't have easy LRU eviction; rely on count cap with oldest trim
-    # Keep it simple and cheap:
     con.execute("DELETE FROM last_artist_play WHERE rowid NOT IN (SELECT rowid FROM last_artist_play ORDER BY ts DESC LIMIT ?)", (HISTORY_KEEP,))
     con.execute("DELETE FROM last_title_play  WHERE rowid NOT IN (SELECT rowid FROM last_title_play  ORDER BY ts DESC LIMIT ?)", (HISTORY_KEEP,))
     con.execute("DELETE FROM last_path_play   WHERE rowid NOT IN (SELECT rowid FROM last_path_play   ORDER BY ts DESC LIMIT ?)", (HISTORY_KEEP_PATHS,))
@@ -292,11 +345,35 @@ def track_start(con, artist: str, title: str, path: str):
     con.execute("DELETE FROM last_title_play  WHERE rowid NOT IN (SELECT rowid FROM last_title_play  ORDER BY ts DESC LIMIT ?)", (HISTORY_KEEP,))
     con.execute("DELETE FROM last_path_play   WHERE rowid NOT IN (SELECT rowid FROM last_path_play   ORDER BY ts DESC LIMIT ?)", (HISTORY_KEEP_PATHS,))
 
+# ------------- EVERGREEN -------------
+def pick_evergreen() -> str:
+    """Pick a random audio file from the evergreen directory. Returns empty string if none available."""
+    try:
+        files = [
+            os.path.join(EVERGREEN_DIR, f)
+            for f in os.listdir(EVERGREEN_DIR)
+            if is_audio_file(f)
+        ]
+        if files:
+            return random.choice(files)
+    except Exception:
+        pass
+    return ""
+
+def slot_already_served(con, slot_id: int) -> bool:
+    r = con.execute("SELECT ts FROM evergreen_played WHERE slot_id=?", (slot_id,)).fetchone()
+    return r is not None
+
+def mark_slot_served(con, slot_id: int):
+    con.execute(
+        "INSERT INTO evergreen_played(slot_id, ts) VALUES(?,?) ON CONFLICT(slot_id) DO UPDATE SET ts=excluded.ts",
+        (slot_id, now_ts())
+    )
+    # Keep last 200 entries (well over a day's worth at 4 slots/hour)
+    con.execute("DELETE FROM evergreen_played WHERE rowid NOT IN (SELECT rowid FROM evergreen_played ORDER BY ts DESC LIMIT 200)")
+
 # ------------- PICKING -------------
 def pick_from_cache(con):
-    # Randomize traversal but keep it SQL-simple
-    # We'll sample a chunk (to avoid scanning the whole table) then strict-pass, then least-violating.
-    # If your library is huge and you want smarter sampling, we can add reservoir logic later.
     rows = con.execute("SELECT path, artist_norm, title_norm FROM files ORDER BY random() LIMIT 2000").fetchall()
     if not rows:
         return None
@@ -351,19 +428,16 @@ def ensure_fresh_cache_async(con):
     if (now_ts() - float(gen)) <= RE_SCAN_SEC and con.execute("SELECT 1 FROM files LIMIT 1").fetchone():
         return  # fresh enough
 
-    # Try lock; if we win, fork a builder and parent returns immediately.
     if not try_acquire_lock(con, "cache_builder", LOCK_STALE):
         return
 
     try:
         pid = os.fork()
     except Exception:
-        # Can't fork; build inline (blocking). Better to release lock and do nothing here.
         release_lock(con, "cache_builder")
         return
 
     if pid != 0:
-        # parent: we're done; child builds
         return
 
     # child process
@@ -380,11 +454,21 @@ def cmd_pick_next():
     con = db_connect(); db_init(con)
     ensure_fresh_cache_async(con)
 
-    # Try cached pick
+    # Evergreen slot check: if we're within the window of a quarter-hour boundary
+    # and haven't already served a clip for this slot, return a clip instead of music.
+    # If EVERGREEN_DIR is empty or missing, this is silently skipped.
+    slot_id = current_slot_id()
+    if slot_id >= 0 and not slot_already_served(con, slot_id):
+        clip = pick_evergreen()
+        if clip:
+            mark_slot_served(con, slot_id)
+            print(clip, end="")
+            return
+
+    # Normal music pick
     r = pick_from_cache(con)
     if r:
         path = r["path"]
-        # best-effort selection stamp (on-air overwrite will happen later)
         stamp_selection(con, path, r["artist_norm"], r["title_norm"])
         print(path, end="")
         return
@@ -444,4 +528,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
