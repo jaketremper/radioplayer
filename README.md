@@ -110,7 +110,7 @@ Create a short file of silence (Liquidsoap uses this when no track is picked):
 
 ```bash
 sudo mkdir -p /usr/share/liquidsoap
-sudo ffmpeg -f lavfi -i anullsrc=r=44100:cl=stereo -t 1 -q:a 9 -acodec libmp3lame /usr/share/liquidsoap/_silence.mp3
+sudo ffmpeg -f lavfi -i anullsrc=r=44100:cl=stereo -t 10 -q:a 9 -acodec libmp3lame /usr/share/liquidsoap/_silence.mp3
 ```
 
 The picker outputs a file path to stdout. Liquidsoap reads that path to request the next song.
@@ -250,6 +250,11 @@ Environment=LS_UNKNOWN_ARTIST_BUCKET=1
 # History retention
 Environment=LS_HISTORY_KEEP=10000
 Environment=LS_HISTORY_KEEP_PATHS=20000
+
+# Scheduled content (optional — see "Scheduled Content" section below)
+# Environment=LS_EVERGREEN_DIR=/var/lib/liquidsoap/evergreen
+# Environment=LS_SLOT_PRE_SEC=150
+# Environment=LS_SLOT_POST_SEC=150
 
 LimitNOFILE=131072
 Nice=5
@@ -527,6 +532,78 @@ If you prefer not to run your own nginx:
 
 ---
 
+## Scheduled Content (Station IDs, Drops, Sweepers)
+
+`ls_radio.py` supports automatic injection of scheduled audio content near each quarter-hour boundary (:00, :15, :30, :45). This is useful for station IDs, drops, movie quotes, PSAs, or any short audio you want played periodically.
+
+### How It Works
+
+When `pick-next` is called and the current time falls within a configurable window around a quarter-hour boundary, the picker returns a randomly selected file from `LS_EVERGREEN_DIR` instead of a music track. After one clip is served for a given slot, the picker returns to normal music selection for the remainder of the window — so you always get exactly one clip per quarter hour, played after the current song finishes naturally.
+
+Default windows (with `LS_SLOT_PRE_SEC=150` and `LS_SLOT_POST_SEC=150`):
+
+| Slot | Window |
+|------|--------|
+| :00  | 57:30 – 02:30 |
+| :15  | 12:30 – 17:30 |
+| :30  | 27:30 – 32:30 |
+| :45  | 42:30 – 47:30 |
+
+If a long track is still playing when the window opens, the clip fires as soon as that track ends — no interruptions, no hard cuts.
+
+If `LS_EVERGREEN_DIR` is not set, empty, or the directory doesn't exist, the feature is silently disabled and music plays uninterrupted.
+
+### Setup
+
+Create the evergreen directory and drop your audio files in:
+
+```bash
+sudo mkdir -p /var/lib/liquidsoap/evergreen
+sudo chown liquidsoap:liquidsoap /var/lib/liquidsoap/evergreen
+# Copy your clips — WAV, MP3, FLAC all work
+sudo cp /path/to/your/clips/*.wav /var/lib/liquidsoap/evergreen/
+```
+
+Enable in your systemd unit by uncommenting these lines:
+
+```ini
+Environment=LS_EVERGREEN_DIR=/var/lib/liquidsoap/evergreen
+Environment=LS_SLOT_PRE_SEC=150
+Environment=LS_SLOT_POST_SEC=150
+```
+
+Then reload and restart:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl restart liquidsoap
+```
+
+No changes to `stream.liq` are required.
+
+### Tips for Clip Selection
+
+- **Self-contained clips work best.** Content that lands without setup or context — a memorable line, a sound effect, a short piece of music — works much better than something that's only funny as part of a longer scene.
+- **Normalize your clips** to a consistent loudness before dropping them in. Liquidsoap's normalization chain processes them, but pre-normalized clips give more predictable results.
+- **Any length works**, but clips under 30 seconds feel most natural as breaks. Longer clips are fine too.
+- **New files are picked up automatically** — no restart needed. The evergreen directory is scanned on each pick.
+
+### Tuning the Window
+
+The pre/post window controls how late a track can end and still trigger a clip. Wider windows catch more track endings but increase the chance a clip fires noticeably late:
+
+```ini
+# Tighter window — clips fire closer to the boundary, but long tracks may miss
+Environment=LS_SLOT_PRE_SEC=90
+Environment=LS_SLOT_POST_SEC=90
+
+# Wider window — more forgiving for long tracks, clips may fire up to 5 min late
+Environment=LS_SLOT_PRE_SEC=300
+Environment=LS_SLOT_POST_SEC=300
+```
+
+---
+
 ## Verify Your Setup
 
 After installation, test each component:
@@ -545,7 +622,7 @@ curl http://localhost:8000/status-json.xsl
 # Should return JSON metadata
 
 # 4. Check Liquidsoap logs
-sudo journalctl -u liquidsoap -n 50 --no-pager
+sudo journalctl -fu liquidsoap
 
 # 5. Test the web player
 curl -I https://radio.example.com/radio/
@@ -603,10 +680,6 @@ The picker prevents repetition using three rules:
 5. The selection is stamped in the database
 6. When the track actually starts on-air, `track-start` overwrites with the precise timestamp
 
-**Example:** With a 1000-track library and 45-min artist separation:
-- If you have 50 unique artists, you'll rarely hit the "least-violating" path
-- If you have 5 unique artists, the picker will often choose the artist that's been off-air longest
-
 ---
 
 ## Features
@@ -628,6 +701,7 @@ The picker prevents repetition using three rules:
 - SQLite-backed play history
 - Fast random selection with smart sampling
 - Prevents multiple simultaneous cache rescans
+- Scheduled content injection at quarter-hour boundaries
 - No external dependencies (Python stdlib only)
 
 ### Audio Processing
@@ -708,21 +782,14 @@ Environment=LS_FFPROBE_TIMEOUT_S=1.5
 Environment=LS_RESCAN_SEC=172800  # 48 hours
 ```
 
-Monitor cache rebuild time:
-```bash
-sudo journalctl -u liquidsoap | grep "cache_builder"
-```
-
 ### For Small Libraries (<1000 tracks)
 
 ```ini
 Environment=LS_TOP_N_DIRS=32
 Environment=LS_FILES_PER_DIR_TRY=64
-Environment=LS_ARTIST_SEP_MIN=15  # Lower separation windows
+Environment=LS_ARTIST_SEP_MIN=15
 Environment=LS_TITLE_SEP_MIN=60
 ```
-
-More aggressive settings cause "least violating" picks more often, which is fine for small libraries.
 
 ### For Network-Mounted Music
 
@@ -730,7 +797,7 @@ If your music lives on NFS/SMB:
 
 ```ini
 Environment=LS_FFPROBE_TIMEOUT_S=2.0
-Environment=LS_RESCAN_SEC=43200  # 12 hours (slower network I/O)
+Environment=LS_RESCAN_SEC=43200  # 12 hours
 ```
 
 ---
@@ -774,7 +841,7 @@ sudo journalctl -u icecast2 -n 50
 **Check Liquidsoap:**
 ```bash
 sudo systemctl status liquidsoap
-sudo journalctl -u liquidsoap -n 50 --no-pager
+sudo journalctl -fu liquidsoap
 ```
 
 **Common issues:**
@@ -806,23 +873,57 @@ sudo -u liquidsoap sqlite3 /var/lib/liquidsoap/liquidsoap.db "SELECT COUNT(*) FR
 sudo -u liquidsoap /usr/local/bin/ls_radio.py rebuild-cache
 ```
 
+### Scheduled clips not firing
+
+**Check the evergreen directory:**
+```bash
+ls -la /var/lib/liquidsoap/evergreen/
+# Should contain audio files
+```
+
+**Check the environment variable is set:**
+```bash
+sudo systemctl show liquidsoap | grep EVERGREEN
+```
+
+**Check which slot the picker thinks it's in:**
+```bash
+python3 -c "
+import time
+SLOT_PRE_SEC = 150
+SLOT_POST_SEC = 150
+t = time.localtime()
+total_secs = t.tm_min * 60 + t.tm_sec
+print(f'Current time: {t.tm_hour:02d}:{t.tm_min:02d}:{t.tm_sec:02d}')
+print(f'Seconds into hour: {total_secs}')
+for i, m in enumerate([0,15,30,45]):
+    slot_secs = m * 60
+    if m == 0:
+        print(f'Slot :00 — pre: {3600-total_secs}s away, post: {total_secs}s past')
+    else:
+        diff = total_secs - slot_secs
+        print(f'Slot :{m:02d} — diff: {diff}s (window: -{SLOT_PRE_SEC} to +{SLOT_POST_SEC})')
+"
+```
+
+**Verify a clip was served for the last slot:**
+```bash
+sudo sqlite3 /var/lib/liquidsoap/liquidsoap.db \
+  "SELECT slot_id, datetime(ts, 'unixepoch', 'localtime') FROM evergreen_played ORDER BY ts DESC LIMIT 10;"
+```
+
 ### Player shows "connecting" forever
 
 **Check CORS headers:**
 ```bash
 curl -I https://radio.example.com/live | grep -i access-control
-# Should show: Access-Control-Allow-Origin: *
 ```
 
-**Check browser console** (F12 → Console):
-- Mixed content errors? (HTTP stream on HTTPS page)
-- CORS errors? (nginx config missing)
-- 404 on stream URL? (wrong URL in index.html)
+**Check browser console** (F12 → Console) for mixed content or CORS errors.
 
-**Verify stream is actually running:**
+**Verify stream is running:**
 ```bash
 curl -I http://localhost:8000/live
-# Should return ICY headers or 200 OK
 ```
 
 ### Metadata not updating
@@ -830,77 +931,31 @@ curl -I http://localhost:8000/live
 **Check status endpoint:**
 ```bash
 curl http://localhost:8000/status-json.xsl | jq .
-# Should return valid JSON
 ```
 
-**Check CORS on status endpoint:**
-```bash
-curl -I https://radio.example.com/status-json.xsl | grep -i access-control
-```
-
-**Check mount point name:**
-- Must match in `stream.liq` (`mount="/live"`)
-- Must match in `index.html` (`TARGET_MOUNT = '/live'`)
-- Must match in nginx (`location = /live`)
+**Check mount point name matches** in `stream.liq`, `index.html`, and nginx config.
 
 ### Artwork not loading
-
-**Check nginx cache:**
-```bash
-sudo ls -la /var/cache/nginx/itunes/
-# Should show cache files after first artwork lookup
-```
-
-**Check browser console:**
-- 404 on `/itunes/search`? nginx config missing
-- 404 on `/itunes/art`? nginx config missing
-- No errors but still broken? iTunes API rate limiting
 
 **Test iTunes proxy manually:**
 ```bash
 curl "https://radio.example.com/itunes/search?term=test&entity=song&limit=1"
-# Should return iTunes API JSON
+```
+
+**Check nginx cache:**
+```bash
+sudo ls -la /var/cache/nginx/itunes/
 ```
 
 ### Same songs keep repeating
 
 **Check library size vs separation windows:**
 ```bash
-# How many tracks?
-sudo -u liquidsoap sqlite3 /var/lib/liquidsoap/liquidsoap.db "SELECT COUNT(*) FROM files;"
-
-# How many unique artists?
-sudo -u liquidsoap sqlite3 /var/lib/liquidsoap/liquidsoap.db "SELECT COUNT(DISTINCT artist_norm) FROM files;"
+sudo -u liquidsoap sqlite3 /var/lib/liquidsoap/liquidsoap.db \
+  "SELECT COUNT(*) as tracks, COUNT(DISTINCT artist_norm) as artists FROM files;"
 ```
 
-If you have 5 artists and 45-min artist separation, you'll hear repeats quickly.
-
-**Check database has history:**
-```bash
-sudo sqlite3 /var/lib/liquidsoap/liquidsoap.db "SELECT COUNT(*) FROM last_artist_play;"
-# Should be > 0 after first few tracks
-```
-
-**Solution:** Lower separation windows or increase library size.
-
-### Cache rebuilds taking too long
-
-**Monitor rebuild progress:**
-```bash
-sudo journalctl -u liquidsoap -f
-# Watch for messages about cache building
-```
-
-**Check disk I/O:**
-```bash
-sudo apt install sysstat
-iostat -x 5
-```
-
-**Solutions:**
-- Increase `LS_RESCAN_SEC` to reduce rebuild frequency
-- Reduce library size or split into multiple directories
-- Increase `LS_FFPROBE_TIMEOUT_S` if network-mounted
+If you have few artists and high separation windows, lower `LS_ARTIST_SEP_MIN`.
 
 ---
 
@@ -924,24 +979,16 @@ liquidsoap --check /etc/liquidsoap/stream.liq
 
 ### Player loads but no audio
 
-- **Mixed content:** Browser blocks HTTP streams on HTTPS pages
-  - Solution: Use nginx to proxy the stream over HTTPS
+- **Mixed content:** Browser blocks HTTP streams on HTTPS pages — use nginx to proxy over HTTPS
 - **Wrong stream URL:** Check `STREAM_URL` in `index.html`
 - **Icecast not streaming:** `curl -I http://localhost:8000/live`
 
 ### nginx cache not working
 
 ```bash
-# Check cache directory exists and is writable
-ls -la /var/cache/nginx/itunes/
+sudo ls -la /var/cache/nginx/itunes/
 sudo chown -R www-data:www-data /var/cache/nginx
-
-# Check cache is enabled in config
 grep "proxy_cache_path" /etc/nginx/nginx.conf
-
-# Test cache headers
-curl -I "https://radio.example.com/itunes/search?term=test&entity=song&limit=1"
-# Should show: X-Cache-Status: MISS (first time) or HIT (cached)
 ```
 
 ---
@@ -950,70 +997,15 @@ curl -I "https://radio.example.com/itunes/search?term=test&entity=song&limit=1"
 
 ```text
 radioplayer/
-├── index.html              # Web player (with nginx c
+├── index.html              # Web player (with nginx caching)
+├── index.html.nocache      # Web player (direct iTunes API)
 ├── artwork-512.png         # Fallback album art
 ├── artwork-192.png
 ├── artwork-096.png
-├─ls_radio.py         # Track selector script
+├── ls_radio.py             # Track selector script
 └── config_examples/
     ├── stream.liq          # Liquidsoap config
     ├── icecast.xml         # Icecast config
     ├── nginx               # nginx config
     └── liquidsoap.service  # systemd service
 ```
-
----
-
-## Customization
-
-### Colors (in `index.html`)
-```css
-:root {
-  --bg: #0b1220;      /* Background */
-  --fg: #e8eefc;      /* Text color */
-  --muted: #9bb0d0;   /* Muted text */
-  --accent: #79a8ff;  /* Buttons/links */
-}
-```
-
-### Station Name
-- In `index.html`:
-  - Update `<title>` tag 
-  - Change `artist: 'Your Station Name'` in `setMediaSession()`
-- In `stream.liq`:
-  - Update `name="Your Station Name"`
-   
-### Audio Processing
-Adjust dynamics in `stream.liq`:
-```liquidsoap
-radio = normalize(radio)
-radio = compress(radio, threshold=-12.0, ratio=3.0, attack=0.005, release=0.2, gain=0.0)
-radio = limit(radio, threshold=-1.0, attack=0.002, release=0.2)
-```
-
----
-    
-## Troubleshooting
-    
-### Stream won't start
-- Check Icecast password matches in both configs
-- Verify firewall allows port 8000
-- Check logs: `sudo journalctl -u liquidsoap -f`
-- Verify Icecast is running: `sudo systemctl status icecast2`
-
-### No songs playing
-- Verify `LS_MUSIC_DIR` path is correct and contains audio files
-- Check file permissions: `ls -la /srv/music`
-- Test picker manually: `python3 /usr/local/bin/ls_radio.py`
-- Check Liquidsoap service (sudo journalctl -xeu liquidsoap) logs for errors
-  
-### Player shows "connecting" forever
-- Check CORS headers in nginx config
-- Verify stream URL is accessible: `curl -I https://radio.example.com/live`
-- Check browser console for JavaScript errors
-- Ensure HTTPS is working (mixed content blocks HTTP streams)
-
-### Cache rebuilds taking too long
-- Increase `LS_RESCAN_SEC` to reduce rebuild frequency (default: 24 hours)
-- Reduce library size or split into multiple directories
-- Check disk I/O performance with `iostat`
