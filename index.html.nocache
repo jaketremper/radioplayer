@@ -314,25 +314,26 @@
     return r.json();
   }
 
-  // Force HTTPS for iTunes artwork and provide a robust fallback
+  // Direct iTunes API call (no caching proxy)
   async function findArtwork(artist, title){
     try{
       if (!artist && !title) throw 0;
 
       const q = encodeURIComponent(`${artist} ${title}`.trim());
-      // hits your nginx cache proxy
-      const r = await fetch(`/itunes/search?term=${q}&entity=song&limit=1`, { cache:'no-store' });
+      // Direct iTunes API call
+      const r = await fetch(`https://itunes.apple.com/search?term=${q}&entity=song&limit=1`, { cache:'default' });
       const data = await r.json();
 
       if (data && data.results && data.results.length){
+        // Force HTTPS and upsize artwork
         const secure = (u) => u.replace(/^http:\/\//i, 'https://');
         const raw100 = secure(data.results[0].artworkUrl100);
         const upsize = (u, size) => u.replace(/\d+x\d+bb\.jpg/i, `${size}x${size}bb.jpg`);
 
-        // route image URLs through your nginx image proxy for caching
-	const art512 = `/itunes/art?u=${upsize(raw100,512)}`;
-	const art192 = `/itunes/art?u=${upsize(raw100,192)}`;
-	const art096 = `/itunes/art?u=${upsize(raw100,96)}`;
+        const art512 = upsize(raw100, 512);
+        const art192 = upsize(raw100, 192);
+        const art096 = upsize(raw100, 96);
+
         return { url: art512, ms: [
           { src: art512, sizes:'512x512', type:'image/jpeg' },
           { src: art192, sizes:'192x192', type:'image/jpeg' },
@@ -341,7 +342,7 @@
       }
     }catch(_){}
 
-    // fallback to your bundled PNGs
+    // fallback to bundled PNGs
     return { url: FALLBACK_ART_512, ms:[
       { src: FALLBACK_ART_512, sizes:'512x512', type:'image/png' },
       { src: FALLBACK_ART_192, sizes:'192x192', type:'image/png' },
