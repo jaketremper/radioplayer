@@ -1,7 +1,7 @@
 # Radio Player - Simple Internet Radio Station Setup Guide
 
 A minimal, single-file radio player powered by **Liquidsoap** and **Icecast**.  
-No CMS. No database admin. No app required. Just your music, a stream, and a simple web player.
+No CMS. No app. Just your music, a stream, and a simple web player.
 
 ---
 
@@ -201,7 +201,7 @@ output.icecast(
 
 ```bash
 sudo mkdir -p /etc/liquidsoap
-sudo chown liquidsoap:liquidsoap /etc/liquidsoap
+sudo chown -R liquidsoap:liquidsoap /etc/liquidsoap
 sudo chmod 0700 /etc/liquidsoap
 sudo chmod 0600 /etc/liquidsoap/stream.liq
 ```
