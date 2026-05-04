@@ -312,7 +312,7 @@ Add to your nginx http block (usually in `/etc/nginx/nginx.conf`):
 ```nginx
 # Enable album art caching
 proxy_cache_path /var/cache/nginx/itunes keys_zone=itunes:10m inactive=14d max_size=2g;
-resolver 1.1.1.1 1.0.0.1 valid=300s ipv6=off;
+resolver 9.9.9.9 149.112.112.112 valid=300s ipv6=off;
 
 # Rudimentary scraper blocking
 map $http_user_agent $block_scraper {
